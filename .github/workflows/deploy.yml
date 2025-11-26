@@ -1,0 +1,163 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}  # GitHub Variables에서 가져오기 (기본값: us-east-1)
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate AWS credentials
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "❌ AWS_ACCESS_KEY_ID is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ AWS_SECRET_ACCESS_KEY is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SESSION_TOKEN }}" ]; then
+            echo "⚠️  AWS_SESSION_TOKEN is not set (required for temporary credentials)"
+            exit 1
+          fi
+          echo "✅ AWS credentials are set"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Debug AWS credentials
+        run: |
+          echo "🔍 AWS 자격 증명 확인 중..."
+          echo ""
+          echo "현재 IAM 역할:"
+          aws sts get-caller-identity || echo "❌ 자격 증명 확인 실패"
+          echo ""
+          echo "Access Key ID 시작: ${{ secrets.AWS_ACCESS_KEY_ID }}"
+          echo "Session Token 길이: $(echo -n '${{ secrets.AWS_SESSION_TOKEN }}' | wc -c) 문자"
+          echo ""
+          echo "리전: ${{ env.AWS_REGION }}"
+
+      - name: Check ECR permissions
+        run: |
+          echo "🔍 Checking ECR permissions..."
+          if aws ecr get-authorization-token --region ${{ env.AWS_REGION }} 2>&1 | grep -q "not authorized"; then
+            echo "❌ ECR 권한이 없습니다!"
+            echo ""
+            echo "현재 IAM 역할: $(aws sts get-caller-identity --query Arn --output text)"
+            echo ""
+            echo "해결 방법:"
+            echo "1. Cloud Labs에서 ECR 권한이 있는 세션을 시작하세요"
+            echo "2. 또는 AWS Console에서 IAM 역할에 다음 권한을 추가하세요:"
+            echo "   - ecr:GetAuthorizationToken"
+            echo "   - ecr:BatchCheckLayerAvailability"
+            echo "   - ecr:GetDownloadUrlForLayer"
+            echo "   - ecr:BatchGetImage"
+            echo "   - ecr:PutImage"
+            echo "   - ecr:InitiateLayerUpload"
+            echo "   - ecr:UploadLayerPart"
+            echo "   - ecr:CompleteLayerUpload"
+            exit 1
+          fi
+          echo "✅ ECR 권한 확인 완료"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for Docker
+        id: meta
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          
+          # 이미지 태그 생성
+          if [ "$BRANCH_NAME" = "main" ]; then
+            echo "tags=latest,${SHORT_SHA},${TIMESTAMP}" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${BRANCH_NAME}-${SHORT_SHA},${BRANCH_NAME}-${TIMESTAMP}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          # 애플리케이션 환경변수 (GitHub Variables/Secrets에서 가져오기)
+          APP_NAME: ${{ vars.APP_NAME || 'My Web App' }}
+          NODE_ENV: ${{ vars.NODE_ENV || 'production' }}
+          APP_PORT: ${{ vars.APP_PORT || '3000' }}
+        run: |
+          # 태그들을 배열로 변환
+          IFS=',' read -ra TAGS <<< "$IMAGE_TAGS"
+          
+          # 첫 번째 태그로 이미지 빌드
+          FIRST_TAG="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAGS[0]}"
+          echo "Building image: $FIRST_TAG"
+          
+          # 환경변수를 build args로 전달
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg APP_NAME="${APP_NAME}" \
+            --build-arg NODE_ENV="${NODE_ENV}" \
+            --build-arg PORT="${APP_PORT}" \
+            --tag "$FIRST_TAG" \
+            --load \
+            .
+          
+          # 추가 태그 생성
+          for tag in "${TAGS[@]:1}"; do
+            ADDITIONAL_TAG="${ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+            echo "Tagging image: $ADDITIONAL_TAG"
+            docker tag "$FIRST_TAG" "$ADDITIONAL_TAG"
+          done
+          
+          # 모든 태그 푸시
+          for tag in "${TAGS[@]}"; do
+            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+            echo "Pushing image: $IMAGE_URI"
+            docker push "$IMAGE_URI"
+          done
+          
+          # 출력 설정
+          echo "image=${FIRST_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image_name=${ECR_REGISTRY}/${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
+
+      - name: Image digest
+        run: |
+          echo "✅ Docker 이미지가 성공적으로 ECR에 푸시되었습니다!"
+          echo "Repository: ${{ secrets.ECR_REPOSITORY_NAME }}"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Branch: ${{ steps.meta.outputs.branch }}"
+          echo "SHA: ${{ steps.meta.outputs.sha }}"
+
+      - name: Logout of Amazon ECR
+        if: always()
+        run: docker logout ${{ steps.login-ecr.outputs.registry }}
